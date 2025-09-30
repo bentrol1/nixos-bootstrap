@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # NixOS Bootstrap Script for Tailscale SSH + VS Code Remote Editing
-# Usage: curl -fsSL https://raw.githubusercontent.com/[your-repo]/nixos-bootstrap/main/bootstrap.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/bentrol1/nixos-bootstrap/main/setup.sh | bash
 
 set -euo pipefail
 
@@ -136,12 +136,19 @@ sudo tee /etc/nixos/bootstrap-module.nix > /dev/null << 'EOF'
     NODE_PATH = "${pkgs.nodejs_18}/lib/node_modules";
   };
 
-  # Create symlink for compatibility
-  system.activationScripts.vscode-compat = lib.stringAfter [ "var" ] ''
+  # Create compatibility symlinks - NixOS 25.05 compatible
+  # Using environment.extraInit instead of removed activation scripts
+  environment.extraInit = ''
     # Create compatibility symlinks for VS Code Remote
-    mkdir -p /usr/bin
-    ln -sf ${pkgs.nodejs_18}/bin/node /usr/bin/node || true
-    ln -sf ${pkgs.python3}/bin/python3 /usr/bin/python3 || true
+    if [ ! -d /usr/bin ]; then
+      mkdir -p /usr/bin
+    fi
+    if [ ! -e /usr/bin/node ]; then
+      ln -sf ${pkgs.nodejs_18}/bin/node /usr/bin/node
+    fi
+    if [ ! -e /usr/bin/python3 ]; then
+      ln -sf ${pkgs.python3}/bin/python3 /usr/bin/python3
+    fi
   '';
 }
 EOF
@@ -151,23 +158,79 @@ log "Updating configuration.nix to include bootstrap module..."
 
 # Check if configuration.nix already imports the bootstrap module
 if ! sudo grep -q "bootstrap-module.nix" /etc/nixos/configuration.nix; then
-    # Add the import to the imports list
-    if sudo grep -q "imports = \[" /etc/nixos/configuration.nix; then
-        # If imports list exists, add to it
-        sudo sed -i '/imports = \[/a\    ./bootstrap-module.nix' /etc/nixos/configuration.nix
-    else
-        # If no imports list, create one after the opening brace
-        sudo sed -i '/^{/a\\n  imports = [\n    ./bootstrap-module.nix\n  ];' /etc/nixos/configuration.nix
-    fi
     
-    log "Added bootstrap-module.nix to imports"
+    # Create a more robust approach to add the import
+    # This handles the multiple import sections in NixOS 25.05
+    python3 << 'PYTHON_EOF'
+import re
+import sys
+
+# Read the configuration file
+with open('/etc/nixos/configuration.nix', 'r') as f:
+    content = f.read()
+
+# Check if we already have the import
+if 'bootstrap-module.nix' in content:
+    print("bootstrap-module.nix already imported")
+    sys.exit(0)
+
+# Pattern to find imports sections
+imports_pattern = r'imports\s*=\s*\[\s*(.*?)\s*\];'
+matches = list(re.finditer(imports_pattern, content, re.DOTALL))
+
+if matches:
+    # Add to the first imports section
+    first_match = matches[0]
+    imports_content = first_match.group(1).strip()
+    
+    if imports_content:
+        # Add our module to existing imports
+        new_imports = imports_content + '\n    ./bootstrap-module.nix'
+    else:
+        # First import in empty list
+        new_imports = '\n    ./bootstrap-module.nix\n  '
+    
+    new_content = (
+        content[:first_match.start(1)] +
+        new_imports +
+        content[first_match.end(1):]
+    )
+else:
+    # No imports found, add at the beginning
+    # Find the opening brace and add imports section
+    brace_match = re.search(r'^{', content, re.MULTILINE)
+    if brace_match:
+        insert_pos = brace_match.end()
+        new_content = (
+            content[:insert_pos] +
+            '\n  imports = [\n    ./bootstrap-module.nix\n  ];\n' +
+            content[insert_pos:]
+        )
+    else:
+        print("ERROR: Could not find opening brace in configuration.nix")
+        sys.exit(1)
+
+# Write the updated content
+with open('/etc/nixos/configuration.nix', 'w') as f:
+    f.write(new_content)
+
+print("Added bootstrap-module.nix to imports")
+PYTHON_EOF
+
+    if [[ $? -eq 0 ]]; then
+        log "Successfully added bootstrap-module.nix to configuration imports"
+    else
+        error "Failed to update configuration.nix"
+    fi
 else
     log "bootstrap-module.nix already imported"
 fi
 
 # Rebuild the system
 log "Rebuilding NixOS configuration..."
-sudo nixos-rebuild switch
+if ! sudo nixos-rebuild switch; then
+    error "Failed to rebuild NixOS configuration. Please check the configuration and try again."
+fi
 
 # Start and enable Tailscale
 log "Starting Tailscale service..."
